@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -25,6 +26,77 @@ var (
 		"ip:port of DNS server")
 	dnsZoneFlag = flag.String("zone", "", "dns zone name")
 )
+
+func configEndpoint(ctx context.Context, dnsClient *dns.Client, wgClient *wgctrl.Client, wgDevice *wgtypes.Device) {
+	for _, peer := range wgDevice.Peers {
+		srvCtx, srvCancel := context.WithCancel(ctx)
+		pubKeyBase32 := strings.ToLower(base32.StdEncoding.EncodeToString(peer.PublicKey[:]))
+		pubKeyBase64 := base64.StdEncoding.EncodeToString(peer.PublicKey[:])
+		m := &dns.Msg{}
+		question := fmt.Sprintf("%s._wireguard._udp.%s",
+			pubKeyBase32, dns.Fqdn(*dnsZoneFlag))
+		log.Printf("[%s] quering SRV: %s", pubKeyBase64, question)
+		m.SetQuestion(question, dns.TypeSRV)
+		r, _, err := dnsClient.ExchangeContext(srvCtx, m, *dnsServerFlag)
+		srvCancel()
+		if err != nil {
+			log.Printf(
+				"[%s] failed to lookup SRV: %v", pubKeyBase64, err)
+			continue
+		}
+		if len(r.Answer) < 1 {
+			log.Printf("[%s] no SRV records found", pubKeyBase64)
+			continue
+		}
+		srv, ok := r.Answer[0].(*dns.SRV)
+		if !ok {
+			log.Printf(
+				"[%s] non-SRV answer in response to SRV query: %s",
+				pubKeyBase64, r.Answer[0].String())
+		}
+		if len(r.Extra) < 1 {
+			log.Printf("[%s] SRV response missing extra A/AAAA",
+				pubKeyBase64)
+		}
+		var endpointIP net.IP
+		hostA, ok := r.Extra[0].(*dns.A)
+		if !ok {
+			hostAAAA, ok := r.Extra[0].(*dns.AAAA)
+			if !ok {
+				log.Printf(
+					"[%s] non-A/AAAA extra in SRV response: %s",
+					pubKeyBase64, r.Extra[0].String())
+				continue
+			}
+			endpointIP = hostAAAA.AAAA
+		} else {
+			endpointIP = hostA.A
+		}
+		log.Printf("[%s] endpoint: %s:%d", pubKeyBase64, endpointIP.String(), srv.Port)
+		peerConfig := wgtypes.PeerConfig{
+			PublicKey:  peer.PublicKey,
+			UpdateOnly: true,
+			Endpoint: &net.UDPAddr{
+				IP:   endpointIP,
+				Port: int(srv.Port),
+			},
+		}
+		deviceConfig := wgtypes.Config{
+			PrivateKey:   &wgDevice.PrivateKey,
+			ReplacePeers: false,
+			Peers:        []wgtypes.PeerConfig{peerConfig},
+		}
+		if wgDevice.FirewallMark > 0 {
+			deviceConfig.FirewallMark = &wgDevice.FirewallMark
+		}
+		err = wgClient.ConfigureDevice(*deviceFlag, deviceConfig)
+		if err != nil {
+			log.Printf(
+				"[%s] failed to configure peer on %s, error: %v",
+				pubKeyBase64, *deviceFlag, err)
+		}
+	}
+}
 
 func main() {
 	flag.Parse()
@@ -64,75 +136,17 @@ func main() {
 		dnsClient := &dns.Client{
 			Timeout: time.Second * 5,
 		}
-		for _, peer := range wgDevice.Peers {
+
+		configEndpoint(ctx, dnsClient, wgClient, wgDevice)
+
+		ticker := time.NewTicker(time.Minute)
+		for {
 			select {
 			case <-ctx.Done():
 				return
-			default:
-			}
-			srvCtx, srvCancel := context.WithCancel(ctx)
-			pubKeyBase32 := base32.StdEncoding.EncodeToString(peer.PublicKey[:])
-			pubKeyBase64 := base64.StdEncoding.EncodeToString(peer.PublicKey[:])
-			m := &dns.Msg{}
-			question := fmt.Sprintf("%s._wireguard._udp.%s",
-				pubKeyBase32, dns.Fqdn(*dnsZoneFlag))
-			m.SetQuestion(question, dns.TypeSRV)
-			r, _, err := dnsClient.ExchangeContext(srvCtx, m, *dnsServerFlag)
-			srvCancel()
-			if err != nil {
-				log.Printf(
-					"[%s] failed to lookup SRV: %v", pubKeyBase64, err)
-				continue
-			}
-			if len(r.Answer) < 1 {
-				log.Printf("[%s] no SRV records found", pubKeyBase64)
-				continue
-			}
-			srv, ok := r.Answer[0].(*dns.SRV)
-			if !ok {
-				log.Printf(
-					"[%s] non-SRV answer in response to SRV query: %s",
-					pubKeyBase64, r.Answer[0].String())
-			}
-			if len(r.Extra) < 1 {
-				log.Printf("[%s] SRV response missing extra A/AAAA",
-					pubKeyBase64)
-			}
-			var endpointIP net.IP
-			hostA, ok := r.Extra[0].(*dns.A)
-			if !ok {
-				hostAAAA, ok := r.Extra[0].(*dns.AAAA)
-				if !ok {
-					log.Printf(
-						"[%s] non-A/AAAA extra in SRV response: %s",
-						pubKeyBase64, r.Extra[0].String())
-					continue
-				}
-				endpointIP = hostAAAA.AAAA
-			} else {
-				endpointIP = hostA.A
-			}
-			peerConfig := wgtypes.PeerConfig{
-				PublicKey:  peer.PublicKey,
-				UpdateOnly: true,
-				Endpoint: &net.UDPAddr{
-					IP:   endpointIP,
-					Port: int(srv.Port),
-				},
-			}
-			deviceConfig := wgtypes.Config{
-				PrivateKey:   &wgDevice.PrivateKey,
-				ReplacePeers: false,
-				Peers:        []wgtypes.PeerConfig{peerConfig},
-			}
-			if wgDevice.FirewallMark > 0 {
-				deviceConfig.FirewallMark = &wgDevice.FirewallMark
-			}
-			err = wgClient.ConfigureDevice(*deviceFlag, deviceConfig)
-			if err != nil {
-				log.Printf(
-					"[%s] failed to configure peer on %s, error: %v",
-					pubKeyBase64, *deviceFlag, err)
+			case ts := <-ticker.C:
+				log.Printf("Re-config endpoint: %s", ts.String())
+				configEndpoint(ctx, dnsClient, wgClient, wgDevice)
 			}
 		}
 	}()
